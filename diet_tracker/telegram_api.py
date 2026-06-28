@@ -16,8 +16,10 @@ class TelegramError(RuntimeError):
     pass
 
 
-def _call(method: str, timeout: int = 35, **params):
-    resp = requests.post(f"{_BASE}/{method}", json=params, timeout=timeout)
+def _call(method: str, http_timeout: int = 35, **params):
+    # http_timeout is the requests read timeout; it must not clash with the
+    # Telegram "timeout" body field (used by getUpdates long-polling).
+    resp = requests.post(f"{_BASE}/{method}", json=params, timeout=http_timeout)
     data = resp.json()
     if not data.get("ok"):
         raise TelegramError(data.get("description", "unknown Telegram error"))
@@ -30,7 +32,7 @@ def get_updates(offset: int | None = None, timeout: int = 30):
     if offset is not None:
         params["offset"] = offset
     # The HTTP read timeout must be longer than the long-poll timeout.
-    return _call("getUpdates", timeout=timeout + 5, **params)
+    return _call("getUpdates", http_timeout=timeout + 5, **params)
 
 
 def send_message(chat_id: int, text: str, keyboard: list[list[str]] | None = None):
@@ -50,4 +52,4 @@ def send_message(chat_id: int, text: str, keyboard: list[list[str]] | None = Non
     else:
         # Remove any keyboard left over from a previous step.
         params["reply_markup"] = {"remove_keyboard": True}
-    return _call("sendMessage", timeout=20, **params)
+    return _call("sendMessage", http_timeout=20, **params)
