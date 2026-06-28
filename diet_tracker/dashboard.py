@@ -17,11 +17,33 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
+import config
 import database as db
 from nutrition import compute_targets
 
 st.set_page_config(page_title="Diet Tracker", page_icon="🥗", layout="wide")
 db.init_db()
+
+
+def _require_password():
+    """Gate the whole dashboard behind a password when DASH_PASSWORD is set."""
+    if not config.DASH_PASSWORD:
+        return  # no password configured (local use)
+    if st.session_state.get("auth_ok"):
+        return
+    st.title("🔒 Diet Tracker")
+    entered = st.text_input("Password", type="password")
+    if not entered:
+        st.stop()
+    if entered == config.DASH_PASSWORD:
+        st.session_state["auth_ok"] = True
+        st.rerun()
+    else:
+        st.error("Wrong password.")
+        st.stop()
+
+
+_require_password()
 
 ACTIVITY_LABELS = {
     "sedentary": "Sedentary (little/no exercise)",

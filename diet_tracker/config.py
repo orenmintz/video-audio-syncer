@@ -38,6 +38,12 @@ TIMEZONE = os.environ.get("DIET_TZ", "UTC")
 # it cheaper/faster if you log many meals a day.
 AI_MODEL = os.environ.get("DIET_AI_MODEL", "claude-opus-4-8")
 
+# --- Dashboard security ------------------------------------------------------
+
+# If set, the dashboard asks for this password before showing anything. Leave
+# empty for local use; ALWAYS set it when hosting the dashboard publicly.
+DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
+
 # --- Notification schedule ---------------------------------------------------
 
 # Local hours (24h) at which the bot proactively nudges you with how many

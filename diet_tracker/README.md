@@ -93,11 +93,33 @@ in Telegram.
 | `bot.py` | The bot: meal logging, commands, notifications |
 | `dashboard.py` | Streamlit: profile setup + progress dashboard |
 
+## Hosting it 24/7 (Railway)
+
+Locally the app only works while your terminals are open. To run it around the
+clock, deploy to [Railway](https://railway.app) — it runs the bot and dashboard
+together in one service (`run_all.py`).
+
+1. Push this repo to GitHub (already done if you're reading this there).
+2. On Railway: **New Project → Deploy from GitHub repo** → pick this repo and the
+   branch.
+3. Service **Settings → Root Directory** = `diet_tracker`.
+4. Add a **Volume** mounted at `/data` (so your database survives redeploys).
+5. **Variables** tab — add:
+   - `TELEGRAM_BOT_TOKEN`
+   - `ANTHROPIC_API_KEY`
+   - `DIET_TZ` = `Asia/Jerusalem` (your timezone)
+   - `DIET_DB_PATH` = `/data/diet_tracker.db`
+   - `DASH_PASSWORD` = a password of your choice (protects the public dashboard)
+6. Deploy. Under **Settings → Networking → Generate Domain** to get your dashboard
+   URL. Open it, enter your password, set up your profile, and `/link` it to Telegram.
+
+`run_all.py` auto-restarts the bot or dashboard if either crashes.
+
 ## Notes
 
 - The calorie estimates are AI approximations of typical portion sizes — great for
   tracking trends, not a substitute for a food scale or medical advice.
-- All your data stays in the local `diet_tracker.db` file.
-- The bot must be running for it to receive messages and send notifications.
-  For 24/7 use, run it on a small always-on server (or under `systemd`,
-  `pm2`, `screen`, etc.).
+- Locally your data stays in `diet_tracker.db`. When hosted, it lives on the
+  Railway volume you mounted.
+- Set `DASH_PASSWORD` whenever the dashboard is reachable from the internet — it's
+  the only thing standing between strangers and your profile/data.
