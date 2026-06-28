@@ -1,24 +1,27 @@
 """
-SQLite persistence layer shared by the Telegram bot and the Streamlit dashboard.
+SQLite persistence layer shared by the Streamlit dashboard and the Telegram bot.
 
-Three tables:
-  users       - one row per Telegram user, including their diet targets and the
-                in-progress onboarding state.
-  meals       - one row per logged meal, with AI-estimated calories/macros.
-  notif_log   - remembers which proactive nudges were already sent (so the
-                scheduler doesn't spam the same slot twice in a day).
+Design:
+  profiles  - your diet profile + targets. Created and edited in the DASHBOARD.
+              A profile is connected to Telegram by a one-time `link_code`.
+  meals     - one row per logged meal (added by the bot from your Telegram texts).
+  notif_log - remembers which proactive nudges were already sent today.
+
+Telegram is only used to log food; all profile details are set in the dashboard.
+The bot finds the right profile from the Telegram chat that sent the message
+(after you connect them once with `/link <code>`).
 """
 
 import json
+import secrets
 import sqlite3
+import string
 import threading
 from contextlib import contextmanager
 from datetime import datetime
 
 from config import DB_PATH
 
-# SQLite connections can't be shared across threads, so we serialise writes with
-# a lock and open short-lived connections per operation.
 _lock = threading.Lock()
 
 
@@ -37,8 +40,8 @@ def init_db():
     with _lock, _connect() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id            INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS profiles (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 name               TEXT,
                 sex                TEXT,
                 age                INTEGER,
@@ -52,14 +55,14 @@ def init_db():
                 protein_g          INTEGER,
                 carbs_g            INTEGER,
                 fat_g              INTEGER,
-                onboarding_state   TEXT,
-                onboarded          INTEGER DEFAULT 0,
+                telegram_chat_id   INTEGER UNIQUE,
+                link_code          TEXT,
                 created_at         TEXT
             );
 
             CREATE TABLE IF NOT EXISTS meals (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id         INTEGER NOT NULL,
+                profile_id      INTEGER NOT NULL,
                 description     TEXT,
                 calories        INTEGER,
                 protein_g       REAL,
@@ -70,81 +73,131 @@ def init_db():
                 logged_at       TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_meals_user_date
-                ON meals (user_id, local_date);
+            CREATE INDEX IF NOT EXISTS idx_meals_profile_date
+                ON meals (profile_id, local_date);
 
             CREATE TABLE IF NOT EXISTS notif_log (
-                user_id     INTEGER NOT NULL,
+                profile_id  INTEGER NOT NULL,
                 local_date  TEXT NOT NULL,
                 slot        TEXT NOT NULL,
                 sent_at     TEXT,
-                PRIMARY KEY (user_id, local_date, slot)
+                PRIMARY KEY (profile_id, local_date, slot)
             );
             """
         )
 
 
-# --- Users -------------------------------------------------------------------
+def _new_link_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(6))
 
-def get_user(user_id: int):
+
+# --- Profiles (managed by the dashboard) -------------------------------------
+
+PROFILE_FIELDS = (
+    "name", "sex", "age", "height_cm", "weight_kg", "activity_level",
+    "goal", "goal_rate", "sleep_hour", "daily_calories", "protein_g",
+    "carbs_g", "fat_g",
+)
+
+
+def create_profile(**fields) -> int:
+    """Create a new profile and return its id. Generates a Telegram link code."""
+    cols = [k for k in fields if k in PROFILE_FIELDS]
+    with _lock, _connect() as conn:
+        placeholders = ", ".join(["?"] * (len(cols) + 2))
+        conn.execute(
+            f"INSERT INTO profiles ({', '.join(cols)}, link_code, created_at) "
+            f"VALUES ({placeholders})",
+            (*[fields[c] for c in cols], _new_link_code(), datetime.utcnow().isoformat()),
+        )
+        return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+
+def update_profile(profile_id: int, **fields):
+    cols = [k for k in fields if k in PROFILE_FIELDS]
+    if not cols:
+        return
+    with _lock, _connect() as conn:
+        sets = ", ".join(f"{c} = ?" for c in cols)
+        conn.execute(
+            f"UPDATE profiles SET {sets} WHERE id = ?",
+            (*[fields[c] for c in cols], profile_id),
+        )
+
+
+def get_profile(profile_id: int):
     with _connect() as conn:
         row = conn.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            "SELECT * FROM profiles WHERE id = ?", (profile_id,)
         ).fetchone()
         return dict(row) if row else None
 
 
-def upsert_user(user_id: int, **fields):
-    """Insert the user if new, otherwise update only the provided columns."""
-    with _lock, _connect() as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if not exists:
-            conn.execute(
-                "INSERT INTO users (user_id, created_at) VALUES (?, ?)",
-                (user_id, datetime.utcnow().isoformat()),
-            )
-        if fields:
-            cols = ", ".join(f"{k} = ?" for k in fields)
-            conn.execute(
-                f"UPDATE users SET {cols} WHERE user_id = ?",
-                (*fields.values(), user_id),
-            )
-
-
-def set_onboarding_state(user_id: int, state: dict | None):
-    upsert_user(user_id, onboarding_state=json.dumps(state) if state else None)
-
-
-def get_onboarding_state(user_id: int) -> dict | None:
-    user = get_user(user_id)
-    if user and user.get("onboarding_state"):
-        return json.loads(user["onboarding_state"])
-    return None
-
-
-def all_users():
+def list_profiles():
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM users WHERE onboarded = 1"
+            "SELECT * FROM profiles ORDER BY created_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Telegram linking --------------------------------------------------------
+
+def get_profile_by_chat(chat_id: int):
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE telegram_chat_id = ?", (chat_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def link_chat(code: str, chat_id: int):
+    """Connect a Telegram chat to the profile holding `code`. Returns it or None."""
+    code = code.strip().upper()
+    with _lock, _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE link_code = ?", (code,)
+        ).fetchone()
+        if not row:
+            return None
+        # Detach this chat from any other profile, then attach it here.
+        conn.execute(
+            "UPDATE profiles SET telegram_chat_id = NULL WHERE telegram_chat_id = ?",
+            (chat_id,),
+        )
+        conn.execute(
+            "UPDATE profiles SET telegram_chat_id = ? WHERE id = ?",
+            (chat_id, row["id"]),
+        )
+        return dict(conn.execute(
+            "SELECT * FROM profiles WHERE id = ?", (row["id"],)
+        ).fetchone())
+
+
+def active_profiles():
+    """Profiles connected to Telegram and ready for notifications."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM profiles WHERE telegram_chat_id IS NOT NULL "
+            "AND daily_calories IS NOT NULL"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 # --- Meals -------------------------------------------------------------------
 
-def add_meal(user_id: int, description: str, estimate: dict, local_date: str):
+def add_meal(profile_id: int, description: str, estimate: dict, local_date: str):
     with _lock, _connect() as conn:
         conn.execute(
             """
             INSERT INTO meals
-                (user_id, description, calories, protein_g, carbs_g, fat_g,
+                (profile_id, description, calories, protein_g, carbs_g, fat_g,
                  items_json, local_date, logged_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id,
+                profile_id,
                 description,
                 estimate["total_calories"],
                 estimate["total_protein_g"],
@@ -157,16 +210,16 @@ def add_meal(user_id: int, description: str, estimate: dict, local_date: str):
         )
 
 
-def meals_for_date(user_id: int, local_date: str):
+def meals_for_date(profile_id: int, local_date: str):
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM meals WHERE user_id = ? AND local_date = ? ORDER BY logged_at",
-            (user_id, local_date),
+            "SELECT * FROM meals WHERE profile_id = ? AND local_date = ? ORDER BY logged_at",
+            (profile_id, local_date),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def day_totals(user_id: int, local_date: str) -> dict:
+def day_totals(profile_id: int, local_date: str) -> dict:
     with _connect() as conn:
         row = conn.execute(
             """
@@ -176,18 +229,19 @@ def day_totals(user_id: int, local_date: str) -> dict:
                 COALESCE(SUM(carbs_g), 0)   AS carbs_g,
                 COALESCE(SUM(fat_g), 0)     AS fat_g,
                 COUNT(*)                    AS meal_count
-            FROM meals WHERE user_id = ? AND local_date = ?
+            FROM meals WHERE profile_id = ? AND local_date = ?
             """,
-            (user_id, local_date),
+            (profile_id, local_date),
         ).fetchone()
         return dict(row)
 
 
-def delete_last_meal(user_id: int, local_date: str) -> bool:
+def delete_last_meal(profile_id: int, local_date: str) -> bool:
     with _lock, _connect() as conn:
         row = conn.execute(
-            "SELECT id FROM meals WHERE user_id = ? AND local_date = ? ORDER BY logged_at DESC LIMIT 1",
-            (user_id, local_date),
+            "SELECT id FROM meals WHERE profile_id = ? AND local_date = ? "
+            "ORDER BY logged_at DESC LIMIT 1",
+            (profile_id, local_date),
         ).fetchone()
         if not row:
             return False
@@ -195,7 +249,7 @@ def delete_last_meal(user_id: int, local_date: str) -> bool:
         return True
 
 
-def history(user_id: int, days: int = 30):
+def history(profile_id: int, days: int = 30):
     """Per-day calorie totals for the last `days`, newest first."""
     with _connect() as conn:
         rows = conn.execute(
@@ -205,30 +259,31 @@ def history(user_id: int, days: int = 30):
                    SUM(protein_g) AS protein_g,
                    COUNT(*)       AS meal_count
             FROM meals
-            WHERE user_id = ?
+            WHERE profile_id = ?
             GROUP BY local_date
             ORDER BY local_date DESC
             LIMIT ?
             """,
-            (user_id, days),
+            (profile_id, days),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 # --- Notification log --------------------------------------------------------
 
-def was_notified(user_id: int, local_date: str, slot: str) -> bool:
+def was_notified(profile_id: int, local_date: str, slot: str) -> bool:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM notif_log WHERE user_id = ? AND local_date = ? AND slot = ?",
-            (user_id, local_date, slot),
+            "SELECT 1 FROM notif_log WHERE profile_id = ? AND local_date = ? AND slot = ?",
+            (profile_id, local_date, slot),
         ).fetchone()
         return row is not None
 
 
-def mark_notified(user_id: int, local_date: str, slot: str):
+def mark_notified(profile_id: int, local_date: str, slot: str):
     with _lock, _connect() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO notif_log (user_id, local_date, slot, sent_at) VALUES (?, ?, ?, ?)",
-            (user_id, local_date, slot, datetime.utcnow().isoformat()),
+            "INSERT OR IGNORE INTO notif_log (profile_id, local_date, slot, sent_at) "
+            "VALUES (?, ?, ?, ?)",
+            (profile_id, local_date, slot, datetime.utcnow().isoformat()),
         )
